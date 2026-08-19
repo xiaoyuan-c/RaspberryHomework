@@ -12,9 +12,7 @@ from multiprocessing import Pool
 # ============================================================
 
 PYTHON_RE = r"(?:python(?:\d+(?:\.\d+)*)?|pypy(?:\d+)?)"
-
 SHELL_RE = r"(?:bash|sh|zsh|dash|ksh)"
-
 SCRIPT_E_RE = r"(?:node|nodejs|perl|ruby)"
 
 ALL_INTERPRETERS_RE = (
@@ -26,51 +24,35 @@ ALL_INTERPRETERS_RE = (
     rf")"
 )
 
-
-# ============================================================
-# Regex patterns
-# ============================================================
-
+# python 前面允许：
+# 空格、&&、;、|、>、引号、换行等等
 #
-# 前面只要求不是普通字母/数字/下划线。
+# 但防止：
+# mypython
+# abc_python
 #
-# 因此以下都可以识别：
-#
-#   python
-#   ;python
-#   &&python
-#   |python
-#   >python
-#   "python
-#   'python
-#   \npython
-#
-# 但不会把：
-#
-#   mypython
-#   cpython
-#
-# 当成 python。
-#
-
+# 中间的 python 被错误命中
 PREFIX = r"(?<![A-Za-z0-9_])"
 
-# 可选绝对路径：
+# 支持：
 # /usr/bin/python3
-# /usr/local/bin/bash
+# /usr/local/bin/python
 PATH_PREFIX = r"(?:[A-Za-z0-9_.+\-/]+/)?"
 
+
+# ============================================================
+# Patterns
+# ============================================================
 
 PATTERNS = (
 
     # ========================================================
-    # 1. Python / PyPy -c
+    # 1. python -c
     #
     # python -c "..."
     # python3 -c "..."
     # python3 -u -c "..."
-    # /usr/bin/python3 -c "..."
-    # cd /tmp &&python -c "..."
+    # cd xxx && python -c "..."
     # ========================================================
     re.compile(
         rf"""
@@ -102,7 +84,7 @@ PATTERNS = (
 
 
     # ========================================================
-    # 2. bash/sh/zsh/... -c
+    # 2. shell -c
     #
     # bash -c "..."
     # sh -c "..."
@@ -138,10 +120,6 @@ PATTERNS = (
 
     # ========================================================
     # 3. node/perl/ruby -e
-    #
-    # node -e "..."
-    # perl -e "..."
-    # ruby -e "..."
     # ========================================================
     re.compile(
         rf"""
@@ -173,9 +151,7 @@ PATTERNS = (
 
 
     # ========================================================
-    # 4. PHP -r
-    #
-    # php -r 'echo "xxx";'
+    # 4. php -r
     # ========================================================
     re.compile(
         rf"""
@@ -201,17 +177,11 @@ PATTERNS = (
 
 
     # ========================================================
-    # 5. Interpreter + heredoc
+    # 5. interpreter + heredoc
     #
     # python <<EOF
-    #
-    # python <<'PY'
-    #
-    # python3 - <<PY
-    #
+    # python3 - <<'PY'
     # bash <<EOF
-    #
-    # xxx && python3 - <<'PY'
     # ========================================================
     re.compile(
         rf"""
@@ -233,11 +203,9 @@ PATTERNS = (
 
 
     # ========================================================
-    # 6. Heredoc pipe 到解释器
+    # 6. heredoc | interpreter
     #
     # cat <<EOF | python
-    #
-    # cat <<'PY' | python3
     # ========================================================
     re.compile(
         rf"""
@@ -262,19 +230,11 @@ PATTERNS = (
 
 
     # ========================================================
-    # 7. 非法/污染形式：
+    # 7. Python + triple quote
     #
     # python"""xxx"""
-    #
     # python'''xxx'''
-    #
-    # python """xxx"""
-    #
-    # python3'''xxx'''
-    #
-    # xxx\npython"""xxx"""\nprint(...)
-    #
-    # 这种一般是源码错误地混入 source 字段。
+    # python3"""xxx"""
     # ========================================================
     re.compile(
         rf"""
@@ -293,31 +253,94 @@ PATTERNS = (
         """,
         re.IGNORECASE | re.VERBOSE,
     ),
+
+
+    # ========================================================
+    # 8. 【新增】python 后面直接粘源码/异常文本
+    #
+    # pythonxxx
+    # pythonprint(...)
+    # pythonimport
+    # python"""xxx"""
+    # python'xxx'
+    # python("xxx")
+    #
+    # 也支持：
+    # cd xxx && pythonxxx
+    # xxx;pythonimport
+    #
+    # 正常版本号不会误杀：
+    # python3
+    # python3.11
+    # ========================================================
+    re.compile(
+        rf"""
+        {PREFIX}
+        {PATH_PREFIX}
+        {PYTHON_RE}
+
+        (?=
+            [A-Za-z_]
+            |
+            ["']
+            |
+            \(
+            |
+            \[
+            |
+            \{{
+        )
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    ),
+
+
+    # ========================================================
+    # 9. 【新增】Python 解释器后直接换行
+    #
+    # python\nxxxx
+    #
+    # python3\nimport os
+    #
+    # cd xxx && python\nprint(...)
+    #
+    # TSV 中的字面量 \n 会先被转换成真正换行。
+    #
+    # 这种通常表示：
+    # Python 源码被错误拼接进 source。
+    # ========================================================
+    re.compile(
+        rf"""
+        {PREFIX}
+        {PATH_PREFIX}
+        {PYTHON_RE}
+        \b
+        [ \t]*
+        \r?\n
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    ),
 )
 
 
 # ============================================================
-# Source normalization
+# Normalize source
 # ============================================================
 
 def normalize_source(source: str) -> str:
     """
-    仅在内存中用于检测。
+    仅在内存中规范化 source，用于检测。
 
-    不修改最终输出的 source 内容。
+    不会修改最终 TSV 中的数据。
 
-    很多 TSV 数据可能保存的是字面字符串：
+    例如 TSV 中实际存储：
 
-        abc\\npython -c "xxx"
+        cd /tmp\\npython -c "xxx"
 
-    而不是实际换行。
+    转换为：
 
-    临时转为：
-
-        abc
+        cd /tmp
         python -c "xxx"
-
-    再进行检测。
     """
 
     if not source:
@@ -325,7 +348,7 @@ def normalize_source(source: str) -> str:
 
     source = str(source)
 
-    # 注意顺序，先处理 \r\n
+    # 顺序很重要
     source = source.replace(r"\r\n", "\n")
     source = source.replace(r"\n", "\n")
     source = source.replace(r"\r", "\n")
@@ -340,12 +363,11 @@ def normalize_source(source: str) -> str:
 
 def contains_inline_source(source: str) -> bool:
     """
-    返回 True:
-        source 包含内嵌代码、heredoc 或明显源码污染，
-        删除整条记录。
+    True:
+        删除该记录。
 
-    返回 False:
-        保留。
+    False:
+        保留该记录。
     """
 
     if not source:
@@ -365,14 +387,12 @@ def contains_inline_source(source: str) -> bool:
 # ============================================================
 
 def process_chunk(rows):
-    """
-    一个 worker 一次处理一批数据。
-    """
 
     kept_rows = []
     removed = 0
 
     for row in rows:
+
         source = row.get("source", "") or ""
 
         if contains_inline_source(source):
@@ -384,13 +404,11 @@ def process_chunk(rows):
 
 
 def read_chunks(reader, chunk_size):
-    """
-    流式读取，避免一次把整个 TSV 放进内存。
-    """
 
     chunk = []
 
     for row in reader:
+
         chunk.append(row)
 
         if len(chunk) >= chunk_size:
@@ -402,15 +420,16 @@ def read_chunks(reader, chunk_size):
 
 
 # ============================================================
-# Cleaning
+# TSV cleaning
 # ============================================================
 
 def clean_tsv(
-    input_file: str,
-    output_file: str,
-    workers: int,
-    chunk_size: int,
+    input_file,
+    output_file,
+    workers,
+    chunk_size,
 ):
+
     total = 0
     kept = 0
     removed = 0
@@ -433,8 +452,8 @@ def clean_tsv(
 
         if "source" not in reader.fieldnames:
             raise ValueError(
-                "TSV 中不存在 source 字段。\n"
-                f"当前字段：{reader.fieldnames}"
+                f"TSV 中不存在 source 字段，当前字段："
+                f"{reader.fieldnames}"
             )
 
         with open(
@@ -459,7 +478,10 @@ def clean_tsv(
                 chunk_size,
             )
 
-            # 单核时直接执行，避免 multiprocessing 开销
+            # =================================================
+            # 单进程
+            # =================================================
+
             if workers == 1:
 
                 for chunk in chunks:
@@ -483,11 +505,15 @@ def clean_tsv(
                             flush=True,
                         )
 
+            # =================================================
+            # 多进程
+            # =================================================
+
             else:
 
                 with Pool(processes=workers) as pool:
 
-                    # imap 保证输出顺序和原始 TSV 一致
+                    # imap 保证输出顺序不变
                     for (
                         kept_rows,
                         removed_count,
@@ -514,13 +540,12 @@ def clean_tsv(
                             )
 
     print()
-
     print("=" * 60)
     print(f"总记录数:   {total:,}")
     print(f"保留记录数: {kept:,}")
     print(f"过滤记录数: {removed:,}")
 
-    if total > 0:
+    if total:
         print(f"过滤比例:   {removed / total:.2%}")
 
     print(f"CPU进程数:  {workers}")
@@ -543,9 +568,8 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "过滤 TSV source 字段中的内嵌源码、"
-            "heredoc 和明显源码污染数据。"
-            "普通脚本文件执行如 python test.py 会保留。"
+            "过滤 TSV source 中的内嵌源码、heredoc、"
+            "非法 Python 调用及源码污染数据"
         )
     )
 
@@ -563,17 +587,14 @@ def main():
         "--workers",
         type=int,
         default=default_workers,
-        help=(
-            f"并行进程数，默认 CPU 数 - 1。"
-            f"当前默认值：{default_workers}"
-        ),
+        help=f"CPU 并行进程数，默认 {default_workers}",
     )
 
     parser.add_argument(
         "--chunk-size",
         type=int,
         default=5000,
-        help="每个并行任务处理的数据条数，默认 5000",
+        help="每批数据量，默认 5000",
     )
 
     args = parser.parse_args()
